@@ -1,1 +1,1 @@
-console.log('index file');
+console.log('indexed file');
