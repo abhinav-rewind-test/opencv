@@ -1,1 +1,1 @@
-console.log('index file for opencv');
+console.log('index file - opencv');
