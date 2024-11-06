@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <opencv2/dnn/shape_utils.hpp>
 #include "../precomp.hpp"
+#include "../ie_ngraph.hpp"
 #include "layers_common.hpp"
 #include "cpu_kernels/fast_gemm.hpp"
 
@@ -304,7 +305,7 @@ public:
     MatShape einsumOutDims; // vector to store output dimentions
 
     // These hold equation subring, left hand side and right it of
-    String lhs_eq, rhs_eq;
+    String lhs_eq, rhs_eq, equation;
 
     // Holds token from left hand side of the equation
     std::vector<String> lhs_eq_tokens;
@@ -378,7 +379,7 @@ public:
     LayerEinsumImpl(const LayerParams& params)
     {
         setParamsFrom(params);
-        String equation = params.get<String>("equation");
+        equation = params.get<String>("equation");
         int outputSize = params.get<int>("outputSize");
         numInputs  = params.get<int>("inputSize");
 
@@ -423,6 +424,11 @@ public:
         calculateOutputShape();
     }
 
+    virtual bool supportBackend(int backendId) CV_OVERRIDE {
+        return backendId == DNN_BACKEND_OPENCV ||
+               backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH;
+    }
+
     // getMeoryShapes
     bool getMemoryShapes(const std::vector<MatShape> &inputs,
                          const int requiredOutputs,
@@ -453,6 +459,7 @@ public:
     {
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
+        CV_CheckEQ((size_t)inputs_arr.total(), (size_t)numInputs, "Number of inputs in forward and inputs during graph constructions do not match");
 
         if (inputs_arr.depth() == CV_16F)
         {
@@ -535,7 +542,7 @@ public:
                 // Use either the preprocessed inputs (if it is available) or the corresponding raw inputs
                 result = pairwiseOperandProcess(!result.empty() ? result : rawInputs[0],
                                                 !result.empty() ? tmpResult : homogenizedInputDims[0],
-                                                !preProcessedInputs[input].empty() ? preProcessedInputs[input] : rawInputs[input],
+                                                (!preProcessedInputs[input].empty()) ? preProcessedInputs[input] : rawInputs[input],
                                                 homogenizedInputDims[input],
                                                 reducedDims,
                                                 isFinalPair);
@@ -547,12 +554,25 @@ public:
         MatShape realOutputDims = shape(result);
         size_t realProd = std::accumulate(realOutputDims.begin(), realOutputDims.end(), 1, std::multiplies<int>());
 
-        CV_CheckEQ(reqProd, realProd, "Real output can not be shaped in to requred output");
+        CV_CheckEQ(reqProd, realProd, "Real output can not be shaped in to required output");
 
         // reduce dimentions
         result = result.reshape(1, einsumOutDims.size(), einsumOutDims.data());
         result.copyTo(outputs[0]);
     } // forward
+
+#ifdef HAVE_DNN_NGRAPH
+    virtual Ptr<BackendNode> initNgraph(const std::vector<Ptr<BackendWrapper> >&,
+                                        const std::vector<Ptr<BackendNode> >& nodes) CV_OVERRIDE {
+        ov::OutputVector inputs(nodes.size());
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            inputs[i] = nodes[i].dynamicCast<InfEngineNgraphNode>()->node;
+        }
+        auto einsum = std::make_shared<ov::op::v7::Einsum>(inputs, equation);
+        return new InfEngineNgraphNode(einsum);
+    }
+#endif // HAVE_DNN_NGRAPH
+
 }; // EinsumClass
 
 Mat LayerEinsumImpl::reduceSum(Mat& src, MatShape& reduceAxis)
@@ -586,8 +606,8 @@ void LayerEinsumImpl::preProcessInputs(InputArrayOfArrays& inputs_arr)
     std::vector<cv::Mat> inputs;
     inputs_arr.getMatVector(inputs);
 
-    preProcessedInputs.reserve(inputs.size());
-    homogenizedInputDims.reserve(inputs.size());
+    preProcessedInputs.resize(inputs.size());
+    homogenizedInputDims.resize(inputs.size());
 
     int inputIter = 0;
     for(const Mat& input : inputs)
@@ -596,6 +616,11 @@ void LayerEinsumImpl::preProcessInputs(InputArrayOfArrays& inputs_arr)
 
         // variable to hold processed version of the original input
         MatShape input_dims = shape(input);
+        if (input_dims.empty()){
+            homogenizedInputDims[inputIter] = MatShape(numLetterIndices, 1);
+            ++inputIter;
+            continue;
+        }
 
         const auto& currSubscriptIndices = inputSubscriptIndices[inputIter];
 
@@ -648,9 +673,9 @@ void LayerEinsumImpl::preProcessInputs(InputArrayOfArrays& inputs_arr)
         {
             preprocessed = preprocessed.reshape(1, homogenizedInputDims_.size(), homogenizedInputDims_.data());
         }
+        preProcessedInputs[inputIter] = preprocessed;
+        homogenizedInputDims[inputIter] = homogenizedInputDims_;
 
-        preProcessedInputs.emplace_back(preprocessed);
-        homogenizedInputDims.emplace_back(homogenizedInputDims_);
         ++inputIter;
     }
 }
@@ -1280,11 +1305,12 @@ Mat LayerEinsumImpl::pairwiseOperandProcess(
                 // Covered by ExplicitEinsumAsTensorContractionReshapeFinal.
                 output = output.reshape(1, reshaped_dims.size(), reshaped_dims.data());
             }
-        } else {
-            output = Transpose(
-                output,
-                outputDims,
-                outputPermutation);
+            else {
+                output = Transpose(
+                    output,
+                    outputDims,
+                    outputPermutation);
+            }
         }
     } else {  // This is the final pair - Transpose directly to the output ordering required and copy the contents to the op's output
         // not sure if this finalize shape is needed at all
