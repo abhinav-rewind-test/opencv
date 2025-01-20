@@ -1,1 +1,1 @@
-console.log('Kagaz Dikhao bhai!');
+console.log('Index.js');
